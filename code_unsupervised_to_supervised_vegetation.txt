@@ -1,0 +1,112 @@
+
+import rasterio
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.decomposition import PCA
+from sklearn.metrics import davies_bouldin_score
+from scipy.spatial.distance import cdist
+from skimage.util import img_as_float
+# --- Load Band Data ---
+band_paths = {
+    'blue': 'Band-2-Blue.tif',
+    'green': 'Band-3-Green.tif',
+    'red': 'Band-4-Red.tif',
+    'nir': 'Band-5-NIR.tif',
+    'swir1': 'Band-6-SWIR1.tif',
+    'swir2': 'Band-7-SWIR2.tif'
+}
+
+def load_band(path):
+    with rasterio.open(path) as src:
+        return src.read(1).astype(float)
+
+bands = {name: load_band(path) for name, path in band_paths.items()}
+rows, cols = bands['red'].shape
+stacked = np.dstack([bands[name] for name in band_paths])
+X = stacked.reshape(-1, 6)
+# --- Normalize Features ---
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+# --- NDVI (Vegetation Index) ---
+red = bands['red']
+nir = bands['nir']
+ndvi = (nir - red) / (nir + red + 1e-6)
+ndvi = np.clip(ndvi, -1, 1)
+
+# --- NDWI (Water Index) ---
+green = bands['green']
+ndwi = (green - nir) / (green + nir + 1e-6)
+ndwi = np.clip(ndwi, -1, 1)
+ndwi_thresh = -0.1
+river_mask = ndwi > ndwi_thresh  # Barak River pixels
+
+# --- NDVI Threshold (Exclude river from vegetation mask) ---
+ndvi_thresh = np.percentile(ndvi, 75)
+veg_mask_ndvi = (ndvi > ndvi_thresh) & (~river_mask)  # vegetation but NOT river
+veg_indices = np.where(veg_mask_ndvi.flatten())[0]
+X_veg = X_scaled[veg_indices]
+# --- PCA for Dimensionality Reduction ---
+pca = PCA(n_components=4)
+X_veg_pca = pca.fit_transform(X_veg)
+# --- KMeans Clustering (Binary Conversion) ---
+kmeans = KMeans(n_clusters=2, init='k-means++', random_state=42, n_init=10)
+kmeans_labels = kmeans.fit_predict(X_veg_pca)
+# Identify vegetation cluster based on higher NDVI mean
+veg_ndvi_vals = ndvi.flatten()[veg_indices]
+label_ndvi_means = {label: veg_ndvi_vals[kmeans_labels == label].mean() for label in np.unique(kmeans_labels)}
+veg_cluster_label = max(label_ndvi_means, key=label_ndvi_means.get)
+
+binary_veg_labels = np.zeros_like(kmeans_labels)
+binary_veg_labels[kmeans_labels == veg_cluster_label] = 1
+# --- Train RF Classifier on Vegetation (Binary) ---
+rf = RandomForestClassifier(n_estimators=100, random_state=42)
+rf.fit(X_veg, binary_veg_labels)
+
+# --- Predict Vegetation Map on Full Image ---
+rf_binary_preds = rf.predict(X_scaled)
+rf_binary_map = rf_binary_preds.reshape(rows, cols)
+
+# --- Final Vegetation Mask (Exclude River) ---
+final_vegetation_mask = (rf_binary_map == 1) & (~river_mask)
+# --- RGB Composite ---
+img_rgb = np.dstack([bands['red'], bands['green'], bands['blue']])
+img_rgb_norm = img_as_float(img_rgb / np.max(img_rgb))
+# --- Visualization ---
+plt.figure(figsize=(24, 8))
+
+plt.subplot(2, 3, 1)
+plt.title("RGB Composite")
+plt.imshow(img_rgb_norm)
+
+plt.subplot(2, 3, 2)
+plt.title("NDWI (Water Index)")
+plt.imshow(ndwi, cmap='Blues')
+plt.colorbar(label='NDWI')
+
+plt.subplot(2, 3, 3)
+plt.title("River Mask (NDWI > -0.1)")
+plt.imshow(river_mask, cmap='Blues')
+plt.colorbar(label='River = 1')
+
+plt.subplot(2, 3, 4)
+plt.title("KMeans++ Binary (on Vegetation Pixels)")
+binary_mask_full = np.zeros(X.shape[0])
+binary_mask_full[veg_indices] = binary_veg_labels
+plt.imshow(binary_mask_full.reshape(rows, cols), cmap='YlGn')
+plt.colorbar(label="Vegetation = 1")
+
+plt.subplot(2, 3, 5)
+plt.title("RF Vegetation Map")
+plt.imshow(rf_binary_map, cmap='YlGn')
+plt.colorbar(label="Vegetation = 1")
+
+plt.subplot(2, 3, 6)
+plt.title("Final Vegetation (Excludes River)")
+plt.imshow(final_vegetation_mask, cmap='Greens')
+plt.colorbar(label="Vegetation = 1")
+
+plt.tight_layout()
+plt.show()
