@@ -1,0 +1,1 @@
+# An-Unsupervised-to-Supervised-Framework-for-Vegetation-Mapping-Using-Spectral-Indices
